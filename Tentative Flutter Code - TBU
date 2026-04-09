@@ -1,0 +1,153 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
+import pyodbc
+import random
+
+app = Flask(__name__)
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# --- SQL SERVER CONNECTION ---
+connection_string = (
+    "DRIVER={SQL Server};"
+    "SERVER=localhost\\SQLEXPRESS01;" 
+    "DATABASE=ThesisDB;"
+    "Trusted_Connection=yes;"
+)
+
+# --- GLOBAL STATE ---
+current_game = {
+    "quiz_id": None,
+    "questions": [],
+    "current_question_index": 0,
+    "active": False
+}
+
+student_weights = {}
+
+# --- 1. KAHOOT GAME: SAVING THE QUIZ ---
+@app.route('/save_quiz', methods=['POST'])
+def save_quiz():
+    data = request.json
+    title = data.get('title')
+    questions = data.get('questions')
+
+    try:
+        conn = pyodbc.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("INSERT INTO Quizzes (Title) OUTPUT INSERTED.QuizID VALUES (?)", (title,))
+        quiz_id = cursor.fetchone()[0]
+
+        for q in questions:
+            # This part correctly saves the 'A', 'B', 'C', or 'D' letter from Flutter
+            cursor.execute("""
+                INSERT INTO Questions (QuizID, QuestionText, OptionA, OptionB, OptionC, OptionD, CorrectAnswer)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                quiz_id, 
+                q['text'], 
+                q['a'], 
+                q['b'], 
+                q.get('c', ''), 
+                q.get('d', ''), 
+                q['correct'] # Saves the letter you picked in the dropdown
+            ))
+
+        conn.commit()
+        
+        current_game["quiz_id"] = quiz_id
+        current_game["questions"] = questions
+        current_game["active"] = True
+        
+        print(f"Success: Quiz '{title}' saved with {len(questions)} questions.")
+        return jsonify({"message": "Quiz Saved and Ready!", "quiz_id": quiz_id}), 200
+
+    except Exception as e:
+        print(f"Database Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# --- 2. RECITATION: GET PRESENT STUDENTS ---
+@app.route('/get_students', methods=['GET'])
+def get_students():
+    try:
+        conn = pyodbc.connect(connection_string)
+        cursor = conn.cursor()
+        cursor.execute("SELECT Name FROM Students WHERE IsPresent = 1")
+        students = [row[0] for row in cursor.fetchall()]
+        return jsonify(students), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --- 3. RECITATION: ADAPTIVE WEIGHTED SELECTION ---
+@app.route('/randomize_student', methods=['POST'])
+def randomize_student():
+    data = request.json
+    present_students = data.get('students', [])
+    
+    if not present_students:
+        return jsonify({"error": "No students to pick from"}), 400
+
+    for student in present_students:
+        if student not in student_weights:
+            student_weights[student] = 100 
+
+    active_weights = {s: student_weights[s] for s in present_students}
+    names = list(active_weights.keys())
+    weights = list(active_weights.values())
+    
+    selected_student = random.choices(names, weights=weights, k=1)[0]
+
+    for s in student_weights:
+        if s == selected_student:
+            student_weights[s] = 10  
+        elif s in present_students:
+            student_weights[s] += 15 
+
+    return jsonify({"selected": selected_student}), 200
+
+# --- 4. SOCKET LOGIC (KAHOOT) ---
+@socketio.on('start_quiz_signal') # This is what the Professor App sends
+def start_quiz():
+    if current_game["active"]:
+        current_game["current_question_index"] = 0
+        
+        # We need to broadcast the first question to everyone
+        send_next_question() 
+
+# Make sure your send_next_question() function looks like this:
+def send_next_question():
+    idx = current_game["current_question_index"]
+    question = current_game["questions"][idx]
+    
+    # This 'new_question' MUST match the name in student_page.dart
+    socketio.emit('new_question', {
+        'text': question['text'],
+        'options': question['options'],
+        'correct_answer': question['correct_answer']
+    }, broadcast=True)
+
+def send_next_question():
+    idx = current_game["current_question_index"]
+    if idx < len(current_game["questions"]):
+        question_data = current_game["questions"][idx]
+        
+        # FIXED: Added 'correct_answer' to the emission so students can be graded
+        emit('new_question', {
+            'text': question_data['text'],
+            'options': [
+                question_data['a'], 
+                question_data['b'], 
+                question_data.get('c', ''), 
+                question_data.get('d', '')
+            ],
+            'correct_answer': question_data['correct'], # Sends 'A', 'B', 'C', or 'D'
+            'index': idx
+        }, broadcast=True)
+    else:
+        emit('quiz_over', {"message": "Quiz Complete"}, broadcast=True)
+
+if __name__ == '__main__':
+    # host='0.0.0.0' allows your phone to connect to your laptop's IP
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
