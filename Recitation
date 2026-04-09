@@ -1,0 +1,38 @@
+  # --- 2. RECITATION: GET PRESENT STUDENTS ---
+@app.route('/get_students', methods=['GET'])
+def get_students():
+    try:
+        conn = pyodbc.connect(connection_string)
+        cursor = conn.cursor()
+        cursor.execute("SELECT Name FROM Students WHERE IsPresent = 1")
+        students = [row[0] for row in cursor.fetchall()]
+        return jsonify(students), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --- 3. RECITATION: ADAPTIVE WEIGHTED SELECTION ---
+@app.route('/randomize_student', methods=['POST'])
+def randomize_student():
+    data = request.json
+    present_students = data.get('students', [])
+    
+    if not present_students:
+        return jsonify({"error": "No students to pick from"}), 400
+
+    for student in present_students:
+        if student not in student_weights:
+            student_weights[student] = 100 
+
+    active_weights = {s: student_weights[s] for s in present_students}
+    names = list(active_weights.keys())
+    weights = list(active_weights.values())
+    
+    selected_student = random.choices(names, weights=weights, k=1)[0]
+
+    for s in student_weights:
+        if s == selected_student:
+            student_weights[s] = 10  
+        elif s in present_students:
+            student_weights[s] += 15 
+
+    return jsonify({"selected": selected_student}), 200
